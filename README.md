@@ -20,6 +20,32 @@ local process environment. Keep passwords out of source control.
 
 Run `python app.py`, or use your existing Flask hosting setup.
 
+## Import an existing database export
+
+Place your private `latetrack.sql` next to `app.py` and run:
+
+```text
+python app.py import-database latetrack.sql
+```
+
+Enter your MySQL password at the prompt. This command needs no `.env` file
+or environment variables. For another host or user, add `--host HOST` or
+`--user USER`. Use `--database NAME` to choose the destination database.
+
+The command creates the database and missing tables, then imports missing
+rows. It keeps existing rows when a primary key or username already exists.
+It ignores the export's DROP statements and rolls back the imported data if
+an insert fails. Newly created empty tables can remain after a failed import
+because MySQL commits schema changes separately.
+
+The export includes its stored admin password hash and migration history,
+so importing it into an empty database restores that login without asking
+for a new admin password. If that account already exists, the command keeps
+the destination account's credentials.
+
+Keep the SQL export private. `.gitignore` excludes it from commits. The
+public repository contains the importer, not student records or login hashes.
+
 ## Admin login migration
 
 After setting `TIMEWISE_ADMIN_PASSWORD`, restart Flask and open `/login`.

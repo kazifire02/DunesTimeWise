@@ -1,0 +1,8 @@
+# Private database exports and local configuration
+*.sql
+.env
+.env.*
+
+# Python cache files
+__pycache__/
+*.pyc

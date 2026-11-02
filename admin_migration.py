@@ -1,6 +1,9 @@
 """Apply the requested admin credentials once per database."""
 
 import os
+import re
+from decimal import Decimal
+from pathlib import Path
 from threading import Lock
 
 from werkzeug.security import generate_password_hash
@@ -102,3 +105,210 @@ def ensure_admin_login(get_connection):
         if not _migration_complete:
             migrate_admin_login(get_connection)
             _migration_complete = True
+
+
+# The export stays outside source control. Only these application tables are read.
+_IMPORT_COLUMNS = {
+    "late_arrivals": ("arrival_id", "student_name", "grade", "section", "arrival_time", "recorded_by", "created_at"),
+    "staff_users": ("staff_id", "username", "password_hash", "role", "created_at"),
+    "student_roster": ("student_no", "student_name", "grade", "section", "is_active"),
+    "timewise_migrations": ("migration_id", "applied_at"),
+}
+_IMPORT_SCHEMA = {
+    "late_arrivals": """CREATE TABLE IF NOT EXISTS late_arrivals (
+        arrival_id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        student_name VARCHAR(100) NOT NULL, grade VARCHAR(10) NOT NULL,
+        section VARCHAR(10) NOT NULL, arrival_time DATETIME NOT NULL,
+        recorded_by VARCHAR(100), created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    "staff_users": """CREATE TABLE IF NOT EXISTS staff_users (
+        staff_id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) NOT NULL UNIQUE, password_hash VARCHAR(255) NOT NULL,
+        role VARCHAR(20) NOT NULL DEFAULT 'staff',
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    "student_roster": """CREATE TABLE IF NOT EXISTS student_roster (
+        student_no VARCHAR(30) NOT NULL PRIMARY KEY,
+        student_name VARCHAR(150) NOT NULL, grade VARCHAR(10) NOT NULL,
+        section VARCHAR(10) NOT NULL, is_active TINYINT(1) NOT NULL DEFAULT 1
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    "timewise_migrations": """CREATE TABLE IF NOT EXISTS timewise_migrations (
+        migration_id VARCHAR(100) NOT NULL PRIMARY KEY,
+        applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+}
+
+
+def _dump_statements(text):
+    """Split a mysqldump export without treating quoted semicolons as SQL."""
+    statement = []
+    quote = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            statement.append(char)
+            if char == "\\" and quote != "`" and index + 1 < len(text):
+                index += 1
+                statement.append(text[index])
+            elif char == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    index += 1
+                    statement.append(text[index])
+                else:
+                    quote = None
+        elif char in "'\"`":
+            quote = char
+            statement.append(char)
+        elif text.startswith("--", index) and (index + 2 == len(text) or text[index + 2].isspace()) or char == "#":
+            end = text.find("\n", index)
+            index = len(text) if end == -1 else end
+            statement.append(" ")
+        elif text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            if end == -1:
+                raise ValueError("Unterminated SQL comment")
+            index = end + 1
+            statement.append(" ")
+        elif char == ";":
+            if "".join(statement).strip():
+                yield "".join(statement).strip()
+            statement = []
+        else:
+            statement.append(char)
+        index += 1
+    if quote:
+        raise ValueError("Unterminated SQL string")
+    if "".join(statement).strip():
+        raise ValueError("Incomplete SQL statement")
+
+
+def _dump_values(text):
+    """Parse literals into bound parameters; never execute dump SQL."""
+    index = 0
+    escapes = {"0": "\0", "n": "\n", "r": "\r", "t": "\t", "b": "\b", "Z": "\x1a"}
+    def skip_space():
+        nonlocal index
+        while index < len(text) and text[index].isspace():
+            index += 1
+    while index < len(text):
+        skip_space()
+        if index >= len(text) or text[index] != "(":
+            raise ValueError("Expected a row of SQL literals")
+        index += 1
+        row = []
+        while True:
+            skip_space()
+            if index < len(text) and text[index] == "'":
+                index += 1
+                value = []
+                while index < len(text):
+                    char = text[index]
+                    index += 1
+                    if char == "\\":
+                        if index >= len(text):
+                            raise ValueError("Incomplete SQL escape")
+                        escaped = text[index]
+                        value.append(escapes.get(escaped, escaped))
+                        index += 1
+                    elif char == "'":
+                        if index < len(text) and text[index] == "'":
+                            value.append("'")
+                            index += 1
+                        else:
+                            break
+                    else:
+                        value.append(char)
+                else:
+                    raise ValueError("Unterminated SQL literal")
+                row.append("".join(value))
+            else:
+                end = index
+                while end < len(text) and text[end] not in ",)":
+                    end += 1
+                token = text[index:end].strip()
+                if token.upper() == "NULL":
+                    row.append(None)
+                elif re.fullmatch(r"[+-]?\d+", token):
+                    row.append(int(token))
+                elif re.fullmatch(r"[+-]?\d+\.\d+", token):
+                    row.append(Decimal(token))
+                else:
+                    raise ValueError("Only SQL literals are allowed in imported rows")
+                index = end
+            skip_space()
+            if index >= len(text):
+                raise ValueError("Incomplete SQL row")
+            separator = text[index]
+            index += 1
+            if separator == ")":
+                break
+            if separator != ",":
+                raise ValueError("Invalid SQL value separator")
+        yield tuple(row)
+        skip_space()
+        if index == len(text):
+            return
+        if text[index] != ",":
+            raise ValueError("Invalid SQL row separator")
+        index += 1
+        skip_space()
+        if index == len(text):
+            raise ValueError("Incomplete SQL row list")
+
+
+def read_database_export(sql_file):
+    """Read supported data rows while ignoring DROP, LOCK, SET and dump DDL."""
+    rows = {table: [] for table in _IMPORT_COLUMNS}
+    declared_tables = set()
+    for statement in _dump_statements(Path(sql_file).read_text(encoding="utf-8-sig")):
+        create = re.match(r"CREATE TABLE `([a-z_]+)`", statement, re.IGNORECASE)
+        if create:
+            declared_tables.add(create.group(1))
+        if not re.match(r"INSERT\b", statement, re.IGNORECASE):
+            continue
+        insert = re.fullmatch(r"INSERT INTO `([a-z_]+)` VALUES\s*(.*)", statement, re.IGNORECASE | re.DOTALL)
+        if not insert or insert.group(1) not in rows:
+            raise ValueError("Unsupported INSERT statement in export")
+        table = insert.group(1)
+        for row in _dump_values(insert.group(2)):
+            if len(row) != len(_IMPORT_COLUMNS[table]):
+                raise ValueError(f"Unexpected column count for {table}")
+            rows[table].append(row)
+    if not {"late_arrivals", "staff_users", "student_roster"}.issubset(declared_tables):
+        raise ValueError("The file is not a complete latetrack export")
+    return rows
+
+
+def import_database_export(con, database, rows):
+    """Create missing tables and import missing rows without overwriting data."""
+    if not re.fullmatch(r"[a-zA-Z0-9_]+", database):
+        raise ValueError("Use letters, numbers and underscores in the database name")
+    cursor = con.cursor()
+    try:
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{database}` CHARACTER SET utf8mb4")
+        con.database = database
+        for schema in _IMPORT_SCHEMA.values():
+            cursor.execute(schema)
+        con.start_transaction()
+        counts = {}
+        for table, columns in _IMPORT_COLUMNS.items():
+            primary_key = columns[0]
+            column_sql = ", ".join(f"`{column}`" for column in columns)
+            placeholders = ", ".join(["%s"] * len(columns))
+            # The self-assignment skips primary/unique-key conflicts without
+            # hiding conversion errors or replacing existing accounts/records.
+            query = (f"INSERT INTO `{table}` ({column_sql}) VALUES ({placeholders}) "
+                     f"ON DUPLICATE KEY UPDATE `{primary_key}` = `{table}`.`{primary_key}`")
+            inserted = 0
+            for row in rows[table]:
+                cursor.execute(query, row)
+                inserted += cursor.rowcount == 1
+            counts[table] = {"inserted": inserted, "skipped": len(rows[table]) - inserted}
+        con.commit()
+        return counts
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        cursor.close()

@@ -4,6 +4,7 @@ from flask import (
     url_for, flash, session, jsonify, send_file
 )
 import mysql.connector
+import click
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from io import BytesIO
@@ -11,12 +12,15 @@ from calendar import monthrange
 from collections import Counter
 from functools import wraps
 from werkzeug.security import check_password_hash
-from admin_migration import ensure_admin_login
+from admin_migration import (
+    ensure_admin_login, read_database_export, import_database_export
+)
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.chart import BarChart, Reference
 from openpyxl.utils import get_column_letter
 import os
+import sys
 
 
 # =====================================================
@@ -46,6 +50,40 @@ def get_connection():
         password=os.environ.get("LATETRACK_DB_PASSWORD", ""),
         database="latetrack"
     )
+
+
+@app.cli.command("import-database")
+@click.argument("sql_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--host", default="localhost", show_default=True)
+@click.option("--user", default="root", show_default=True)
+@click.option("--database", default="latetrack", show_default=True)
+@click.option("--password", prompt="MySQL password", hide_input=True)
+def import_database_command(sql_file, host, user, database, password):
+    """Import a private latetrack SQL export without a .env file."""
+    try:
+        rows = read_database_export(sql_file)
+    except (ValueError, OSError) as error:
+        raise click.ClickException(str(error)) from error
+
+    con = None
+    try:
+        con = mysql.connector.connect(
+            host=host, user=user, password=password,
+            connection_timeout=10, autocommit=False
+        )
+        counts = import_database_export(con, database, rows)
+    except (ValueError, mysql.connector.Error) as error:
+        raise click.ClickException(f"Database import failed: {error}") from error
+    finally:
+        if con is not None:
+            con.close()
+
+    for table, count in counts.items():
+        click.echo(
+            f"{table}: {count['inserted']} imported, "
+            f"{count['skipped']} existing rows kept"
+        )
+    click.echo("Import complete. No existing records were overwritten.")
 
 
 # =====================================================
@@ -2312,4 +2350,7 @@ def export_analytics():
 # =====================================================
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    if len(sys.argv) > 1 and sys.argv[1] == "import-database":
+        app.cli.main(args=sys.argv[1:], prog_name="python app.py")
+    else:
+        app.run(debug=True)
