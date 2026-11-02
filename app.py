@@ -11,6 +11,7 @@ from calendar import monthrange
 from collections import Counter
 from functools import wraps
 from werkzeug.security import check_password_hash
+from admin_migration import ensure_admin_login
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.chart import BarChart, Reference
@@ -42,7 +43,7 @@ def get_connection():
     return mysql.connector.connect(
         host="localhost",
         user="root",
-        password="root",
+        password=os.environ.get("LATETRACK_DB_PASSWORD", ""),
         database="latetrack"
     )
 
@@ -66,6 +67,8 @@ def login_required(view):
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    ensure_admin_login(get_connection)
+
     if request.method == "POST":
         username = request.form.get(
             "username", ""
@@ -128,8 +131,13 @@ def logout():
 def student_search_api():
 
     query = request.args.get("q", "").strip()
+    paginated = "page" in request.args
+    page = max(1, request.args.get("page", 1, type=int))
+    page_size = 10
 
     if len(query) < 2:
+        if paginated:
+            return jsonify(students=[], page=page, has_more=False)
         return jsonify([])
 
     con = get_connection()
@@ -146,19 +154,28 @@ def student_search_api():
             FROM student_roster
             WHERE is_active = 1
             AND student_name LIKE %s
-            ORDER BY student_name, grade, section
-            LIMIT 50
+            ORDER BY student_name, grade, section, student_no
+            LIMIT %s OFFSET %s
             """,
-            ("%" + query + "%",)
+            (
+                "%" + query + "%",
+                page_size + 1 if paginated else 50,
+                (page - 1) * page_size if paginated else 0
+            )
         )
 
         students = cursor.fetchall()
+        has_more = paginated and len(students) > page_size
+        if paginated:
+            students = students[:page_size]
 
         for student in students:
             student["student_no"] = str(
                 student["student_no"]
             )
 
+        if paginated:
+            return jsonify(students=students, page=page, has_more=has_more)
         return jsonify(students)
 
     finally:
@@ -178,12 +195,14 @@ def register():
 
     if request.method == "POST":
 
-        student_no = request.form.get(
-            "student_no", ""
-        ).strip()
+        student_numbers = list(dict.fromkeys(
+            number.strip()
+            for number in request.form.getlist("student_no")
+            if number.strip()
+        ))
 
-        if not student_no:
-            flash("Please select a student from the list.")
+        if not student_numbers:
+            flash("Please select at least one student from the list.")
             return redirect(url_for("register"))
 
         arrival_time = datetime.now(
@@ -210,107 +229,109 @@ def register():
         # Only after 7:40 AM
         if arrival_time <= cutoff_time:
             flash(
-                "The student is on time. "
                 "Late arrivals are recorded only after 7:40 AM."
             )
             return redirect(url_for("register"))
 
         con = get_connection()
         cursor = con.cursor(dictionary=True)
+        registered = []
+        already_registered = 0
 
         try:
-
-            # Automatically retrieve ACTIVE student details
+            # Resolve all selected IDs against the active roster.
+            placeholders = ", ".join(["%s"] * len(student_numbers))
             cursor.execute(
-                """
+                f"""
                 SELECT
                     student_no,
                     student_name,
                     grade,
                     section
                 FROM student_roster
-                WHERE student_no = %s
+                WHERE student_no IN ({placeholders})
                   AND is_active = 1
-                LIMIT 1
                 """,
-                (student_no,)
+                tuple(student_numbers)
             )
 
-            student = cursor.fetchone()
+            students = cursor.fetchall()
+            invalid_count = len(student_numbers) - len(students)
 
-            if not student:
-                flash(
-                    "Student not found in the roster. "
-                    "Please select a valid student."
+            for student in students:
+                student_name = student["student_name"]
+                grade = student["grade"]
+                section = student["section"]
+
+                # Skip today's duplicates without stopping the batch.
+                cursor.execute(
+                    """
+                    SELECT arrival_id
+                    FROM late_arrivals
+                    WHERE LOWER(TRIM(student_name)) = LOWER(%s)
+                      AND grade = %s
+                      AND section = %s
+                      AND DATE(arrival_time) = %s
+                    LIMIT 1
+                    """,
+                    (student_name, grade, section, arrival_time.date())
                 )
-                return redirect(url_for("register"))
 
-            student_name = student["student_name"]
-            grade = student["grade"]
-            section = student["section"]
+                if cursor.fetchone():
+                    already_registered += 1
+                    continue
 
-            # Check whether already registered today
-            cursor.execute(
-                """
-                SELECT arrival_id
-                FROM late_arrivals
-                WHERE LOWER(TRIM(student_name)) = LOWER(%s)
-                  AND grade = %s
-                  AND section = %s
-                  AND DATE(arrival_time) = %s
-                LIMIT 1
-                """,
-                (
-                    student_name,
-                    grade,
-                    section,
-                    arrival_time.date()
+                cursor.execute(
+                    """
+                    INSERT INTO late_arrivals
+                    (
+                        student_name,
+                        grade,
+                        section,
+                        arrival_time,
+                        recorded_by
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        student_name, grade, section,
+                        arrival_time, session["username"]
+                    )
                 )
-            )
-
-            existing_student = cursor.fetchone()
-
-            if existing_student:
-                flash(
-                    f"{student_name} "
-                    f"(Grade {grade}-{section}) "
-                    "has already been registered today!"
-                )
-                return redirect(url_for("register"))
-
-            # Save student with automatic grade and section
-            cursor.execute(
-                """
-                INSERT INTO late_arrivals
-                (
-                    student_name,
-                    grade,
-                    section,
-                    arrival_time,
-                    recorded_by
-                )
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (
-                    student_name,
-                    grade,
-                    section,
-                    arrival_time,
-                    session["username"]
-                )
-            )
+                registered.append(student)
 
             con.commit()
+
+        except Exception:
+            con.rollback()
+            raise
 
         finally:
             cursor.close()
             con.close()
 
-        flash(
-            f"{student_name} "
-            f"(Grade {grade}-{section}) "
-            "registered successfully!"
-        )
+        if len(student_numbers) == 1 and registered:
+            student = registered[0]
+            flash(
+                f"{student['student_name']} "
+                f"(Grade {student['grade']}-{student['section']}) "
+                "registered successfully!"
+            )
+        else:
+            messages = [
+                f"Recorded late arrival for {len(registered)} student(s)."
+            ]
+            if already_registered:
+                messages.append(
+                    f"Skipped {already_registered} student(s) "
+                    "already registered today."
+                )
+            if invalid_count:
+                messages.append(
+                    f"Skipped {invalid_count} student(s) "
+                    "not found in the active roster."
+                )
+            flash(" ".join(messages))
 
         return redirect(url_for("register"))
 

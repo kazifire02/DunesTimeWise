@@ -26,7 +26,7 @@
         .dropdown-arrow {
             position: absolute;
             right: 12px;
-            top: 50%;
+            top: 24px;
             transform: translateY(-50%);
             cursor: pointer;
             color: #800020;
@@ -35,11 +35,7 @@
 
         .student-options {
             display: none;
-            position: absolute;
-            top: 100%;
-            left: 0;
-            right: 0;
-            z-index: 1000;
+            width: 100%;
             max-height: 250px;
             overflow-y: auto;
             background: white;
@@ -54,13 +50,17 @@
         }
 
         .student-option {
+            display: flex;
+            align-items: center;
+            gap: 12px;
             padding: 12px 14px;
             cursor: pointer;
             border-bottom: 1px solid #f1e8eb;
         }
 
         .student-option:hover,
-        .student-option.active {
+        .student-option.active,
+        .student-option[aria-selected="true"] {
             background: #fff0f4;
         }
 
@@ -102,6 +102,69 @@
             margin: 6px 0;
         }
 
+        .student-option-check {
+            display: grid;
+            place-items: center;
+            flex: 0 0 22px;
+            height: 22px;
+            border: 1px solid #800020;
+            border-radius: 4px;
+            color: #800020;
+        }
+
+        .search-help {
+            font-size: 13px;
+        }
+
+        .search-pagination {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .search-pagination[hidden] {
+            display: none;
+        }
+
+        .search-pagination button,
+        .remove-student {
+            width: auto;
+            margin: 0;
+            padding: 8px 12px;
+            font-size: 13px;
+        }
+
+        button:disabled {
+            opacity: .5;
+            cursor: default;
+        }
+
+        .selected-student-list {
+            padding: 0;
+            margin: 0;
+            list-style: none;
+        }
+
+        .selected-student-list li {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 10px 0;
+            border-top: 1px solid #e6cbd3;
+        }
+
+        .selected-student-list li > div {
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }
+
+        .remove-student {
+            flex-shrink: 0;
+        }
+
         #studentCount {
             color: #777;
             font-size: 13px;
@@ -132,8 +195,8 @@
         <h1>Register Late Arrival</h1>
 
         <p>
-            Search for a student's name to register
-            their late arrival.
+            Search by name and select students across result pages.
+            Record their late arrivals together.
         </p>
 
         {% with messages = get_flashed_messages() %}
@@ -151,7 +214,7 @@
               action="{{ url_for('register') }}">
 
             <label for="student_search">
-                Student Name
+                Student Names
             </label>
 
             <div class="student-combobox"
@@ -166,7 +229,7 @@
                     aria-autocomplete="list"
                     aria-expanded="false"
                     aria-controls="studentOptions"
-                    required
+                    aria-describedby="searchHelp studentCount"
                 >
 
                 <span
@@ -179,41 +242,28 @@
                     class="student-options"
                     id="studentOptions"
                     role="listbox"
+                    aria-label="Matching students"
+                    aria-multiselectable="true"
                 ></div>
 
             </div>
 
-            <input
-                type="hidden"
-                name="student_no"
-                id="student_no"
-                value=""
-            >
+            <p id="searchHelp" class="search-help">
+                Select a name to add or remove it. Keep searching to add more students.
+            </p>
+            <p id="studentCount" role="status" aria-live="polite"></p>
 
-            <p id="studentCount"></p>
+            <nav id="searchPagination" class="search-pagination"
+                 aria-label="Student search pages" hidden>
+                <button type="button" id="previousPage">Previous</button>
+                <span id="pageLabel"></span>
+                <button type="button" id="nextPage">Next</button>
+            </nav>
 
-            <!-- AUTOMATIC STUDENT DETAILS -->
-
-            <div class="selected-student"
-                 id="selectedStudent">
-
-                <h3>✓ Student Identified</h3>
-
-                <p>
-                    <strong>Name:</strong>
-                    <span id="selectedName"></span>
-                </p>
-
-                <p>
-                    <strong>Grade:</strong>
-                    <span id="selectedGrade"></span>
-                </p>
-
-                <p>
-                    <strong>Section:</strong>
-                    <span id="selectedSection"></span>
-                </p>
-
+            <div class="selected-student" id="selectedStudents">
+                <h3 id="selectionCount" role="status" aria-live="polite"></h3>
+                <ul id="selectedStudentList" class="selected-student-list"></ul>
+                <div id="selectedStudentInputs"></div>
             </div>
 
             <div class="time-info">
@@ -222,7 +272,7 @@
 
             <button type="submit"
                     id="submitButton">
-                ✓ Record Late Arrival
+                ✓ Record Late Arrivals
             </button>
 
             <button type="reset"
@@ -241,430 +291,7 @@
 
 </div>
 
-<script>
-
-const studentSearch =
-    document.getElementById("student_search");
-
-const studentNo =
-    document.getElementById("student_no");
-
-const studentOptions =
-    document.getElementById("studentOptions");
-
-const studentCount =
-    document.getElementById("studentCount");
-
-const dropdownArrow =
-    document.getElementById("dropdownArrow");
-
-const studentCombobox =
-    document.getElementById("studentCombobox");
-
-const selectedStudent =
-    document.getElementById("selectedStudent");
-
-const selectedName =
-    document.getElementById("selectedName");
-
-const selectedGrade =
-    document.getElementById("selectedGrade");
-
-const selectedSection =
-    document.getElementById("selectedSection");
-
-const arrivalForm =
-    document.getElementById("arrivalForm");
-
-const submitButton =
-    document.getElementById("submitButton");
-
-let matchingStudents = [];
-let activeIndex = -1;
-let searchTimer = null;
-let requestVersion = 0;
-
-
-function closeDropdown() {
-    studentOptions.classList.remove("open");
-
-    studentSearch.setAttribute(
-        "aria-expanded", "false"
-    );
-
-    activeIndex = -1;
-}
-
-
-function openDropdown() {
-    studentOptions.classList.add("open");
-
-    studentSearch.setAttribute(
-        "aria-expanded", "true"
-    );
-}
-
-
-function clearSelection() {
-    studentNo.value = "";
-
-    selectedStudent.classList.remove("visible");
-
-    selectedName.textContent = "";
-    selectedGrade.textContent = "";
-    selectedSection.textContent = "";
-}
-
-
-function selectStudent(student) {
-
-    studentNo.value = student.student_no;
-
-    studentSearch.value = student.student_name;
-
-    selectedName.textContent =
-        student.student_name;
-
-    selectedGrade.textContent =
-        student.grade;
-
-    selectedSection.textContent =
-        student.section;
-
-    selectedStudent.classList.add("visible");
-
-    studentSearch.setCustomValidity("");
-
-    studentCount.textContent =
-        "Student selected successfully.";
-
-    closeDropdown();
-}
-
-
-function renderStudents() {
-
-    studentOptions.innerHTML = "";
-    activeIndex = -1;
-
-    if (matchingStudents.length === 0) {
-
-        const empty =
-            document.createElement("div");
-
-        empty.className = "student-option empty";
-
-        empty.textContent =
-            "No matching students found";
-
-        studentOptions.appendChild(empty);
-
-    } else {
-
-        matchingStudents.forEach(student => {
-
-            const option =
-                document.createElement("div");
-
-            option.className = "student-option";
-
-            option.setAttribute(
-                "role", "option"
-            );
-
-            const name =
-                document.createElement("div");
-
-            name.className =
-                "student-option-name";
-
-            name.textContent =
-                student.student_name;
-
-            const details =
-                document.createElement("div");
-
-            details.className =
-                "student-option-class";
-
-            details.textContent =
-                `Grade ${student.grade} - Section ${student.section}`;
-
-            option.appendChild(name);
-            option.appendChild(details);
-
-            option.addEventListener(
-                "mousedown",
-                function(event) {
-                    event.preventDefault();
-                    selectStudent(student);
-                }
-            );
-
-            studentOptions.appendChild(option);
-
-        });
-
-    }
-
-    openDropdown();
-}
-
-
-async function searchStudents(query) {
-
-    const version = ++requestVersion;
-
-    if (query.trim().length < 2) {
-
-        matchingStudents = [];
-        studentOptions.innerHTML = "";
-
-        studentCount.textContent =
-            "Enter at least 2 characters.";
-
-        closeDropdown();
-        return;
-    }
-
-    studentCount.textContent =
-        "Searching students...";
-
-    try {
-
-        const response = await fetch(
-            `/api/student-search?q=${encodeURIComponent(query)}`
-        );
-
-        if (!response.ok) {
-            throw new Error("Search failed");
-        }
-
-        const students = await response.json();
-
-        if (version !== requestVersion) return;
-
-        matchingStudents = students;
-
-        studentCount.textContent =
-            `${students.length} matching student(s)`;
-
-        renderStudents();
-
-    } catch (error) {
-
-        if (version !== requestVersion) return;
-
-        console.error(error);
-
-        studentCount.textContent =
-            "Unable to search students.";
-
-        closeDropdown();
-    }
-}
-
-
-studentSearch.addEventListener(
-    "input",
-    function() {
-
-        clearSelection();
-
-        studentSearch.setCustomValidity("");
-
-        clearTimeout(searchTimer);
-
-        ++requestVersion;
-
-        const query = this.value;
-
-        searchTimer = setTimeout(() => {
-            searchStudents(query);
-        }, 250);
-    }
-);
-
-
-studentSearch.addEventListener(
-    "focus",
-    function() {
-
-        if (matchingStudents.length > 0) {
-            renderStudents();
-        } else if (this.value.trim().length >= 2
-                   && !studentNo.value) {
-            searchStudents(this.value);
-        }
-    }
-);
-
-
-dropdownArrow.addEventListener(
-    "click",
-    function() {
-
-        if (studentOptions.classList.contains("open")) {
-            closeDropdown();
-        } else {
-            studentSearch.focus();
-
-            if (matchingStudents.length > 0) {
-                renderStudents();
-            } else if (studentSearch.value.trim().length >= 2) {
-                searchStudents(studentSearch.value);
-            }
-        }
-    }
-);
-
-
-studentSearch.addEventListener(
-    "keydown",
-    function(event) {
-
-        if (event.key === "Escape") {
-            closeDropdown();
-            return;
-        }
-
-        if (
-            event.key === "ArrowDown" ||
-            event.key === "ArrowUp"
-        ) {
-
-            event.preventDefault();
-
-            if (!studentOptions.classList.contains("open")) {
-                if (matchingStudents.length > 0) {
-                    renderStudents();
-                }
-            }
-
-            const options = Array.from(
-                studentOptions.querySelectorAll(
-                    '.student-option[role="option"]'
-                )
-            );
-
-            if (options.length === 0) return;
-
-            if (event.key === "ArrowDown") {
-                activeIndex =
-                    (activeIndex + 1) % options.length;
-            } else {
-                activeIndex =
-                    (activeIndex - 1 + options.length)
-                    % options.length;
-            }
-
-            options.forEach((option, index) => {
-                option.classList.toggle(
-                    "active",
-                    index === activeIndex
-                );
-            });
-
-            options[activeIndex].scrollIntoView({
-                block: "nearest"
-            });
-        }
-
-        if (
-            event.key === "Enter" &&
-            studentOptions.classList.contains("open")
-        ) {
-
-            const options =
-                studentOptions.querySelectorAll(
-                    '.student-option[role="option"]'
-                );
-
-            if (activeIndex >= 0 &&
-                options[activeIndex]) {
-
-                event.preventDefault();
-
-                options[activeIndex].dispatchEvent(
-                    new MouseEvent(
-                        "mousedown",
-                        { bubbles: true }
-                    )
-                );
-            }
-        }
-    }
-);
-
-
-document.addEventListener(
-    "mousedown",
-    function(event) {
-
-        if (!studentCombobox.contains(event.target)) {
-            closeDropdown();
-        }
-    }
-);
-
-
-arrivalForm.addEventListener(
-    "submit",
-    function(event) {
-
-        if (!studentNo.value) {
-
-            event.preventDefault();
-
-            studentSearch.setCustomValidity(
-                "Please select a student from the suggestions."
-            );
-
-            studentSearch.reportValidity();
-            studentSearch.focus();
-
-            return;
-        }
-
-        studentSearch.setCustomValidity("");
-
-        submitButton.disabled = true;
-        submitButton.textContent = "Recording...";
-    }
-);
-
-
-arrivalForm.addEventListener(
-    "reset",
-    function() {
-
-        clearTimeout(searchTimer);
-        ++requestVersion;
-
-        setTimeout(() => {
-
-            clearSelection();
-
-            matchingStudents = [];
-
-            studentOptions.innerHTML = "";
-
-            studentCount.textContent = "";
-
-            studentSearch.setCustomValidity("");
-
-            submitButton.disabled = false;
-
-            submitButton.textContent =
-                "✓ Record Late Arrival";
-
-            closeDropdown();
-
-        }, 0);
-    }
-);
-
-</script>
+<script src="{{ url_for('static', filename='register.js') }}" defer></script>
 
 </body>
 </html>
